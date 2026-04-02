@@ -89,7 +89,7 @@ wheels = [
 ]
 
 [[package]]
-name = "litmus-python"
+name = "litmus-python-sdk"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
