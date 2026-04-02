@@ -1,0 +1,33 @@
+[project]
+name = "litmus-python-sdk"
+version = "0.1.0"
+description = "Litmus Python SDK - implicit evals for AI products"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.3,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "litmus"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

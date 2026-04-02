@@ -1,0 +1,489 @@
+"""Litmus Python SDK client.
+
+Drop-in event tracking with background batching, modeled after
+PostHog's producer/consumer architecture. Events go into a
+thread-safe queue, a daemon thread drains them in batches, and
+batch_post() ships them to /v1/events.
+
+    from litmus import LitmusClient
+
+    client = LitmusClient(api_key="ltm_pk_live_...")
+    gen = client.generation("session-123", prompt_id="content_gen")
+    gen.accept()
+    gen.edit(edit_distance=0.3)
+    client.shutdown()
+"""
+
+from __future__ import annotations
+
+import atexit
+import logging
+import queue
+from collections.abc import Callable
+from datetime import UTC, datetime
+from uuid import uuid4
+
+from litmus.consumer import Consumer
+from litmus.request import DEFAULT_HOST, batch_post
+from litmus.version import VERSION
+
+log = logging.getLogger("litmus")
+
+# Same system events the TS SDK knows about
+SYSTEM_EVENTS = frozenset(
+    [
+        "$generation",
+        "$regenerate",
+        "$copy",
+        "$edit",
+        "$abandon",
+        "$accept",
+        "$view",
+        "$partial_copy",
+        "$refine",
+        "$followup",
+        "$rephrase",
+        "$undo",
+        "$share",
+        "$flag",
+        "$rate",
+        "$escalate",
+        "$switch_model",
+        "$retry_context",
+        "$post_accept_edit",
+        "$blur",
+        "$return",
+        "$scroll_regression",
+        "$navigate",
+        "$interrupt",
+    ]
+)
+
+
+class Generation:
+    """Handle for a single AI generation. Lets you record behavioral
+    signals without re-threading IDs on every call.
+
+        gen = client.generation("session-123")
+        gen.accept()
+        gen.edit(edit_distance=0.3)
+    """
+
+    __slots__ = ("id", "_session_id", "_defaults", "_client")
+
+    def __init__(
+        self,
+        client: LitmusClient,
+        session_id: str,
+        generation_id: str,
+        defaults: dict,
+    ):
+        self._client = client
+        self._session_id = session_id
+        self.id = generation_id
+        self._defaults = defaults
+
+    def _emit(self, event_type: str, metadata: dict | None = None) -> None:
+        merged = {**self._defaults.get("metadata", {}), **(metadata or {})}
+        self._client.track(
+            event_type=event_type,
+            session_id=self._session_id,
+            user_id=self._defaults.get("user_id"),
+            prompt_id=self._defaults.get("prompt_id"),
+            prompt_version=self._defaults.get("prompt_version"),
+            generation_id=self.id,
+            metadata=merged if merged else None,
+        )
+
+    def accept(self, metadata: dict | None = None) -> None:
+        self._emit("$accept", metadata)
+
+    def edit(
+        self,
+        edit_distance: float | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        m = {**(metadata or {})}
+        if edit_distance is not None:
+            m["edit_distance"] = edit_distance
+        self._emit("$edit", m)
+
+    def regenerate(self, metadata: dict | None = None) -> None:
+        self._emit("$regenerate", metadata)
+
+    def copy(self, metadata: dict | None = None) -> None:
+        self._emit("$copy", metadata)
+
+    def abandon(self, metadata: dict | None = None) -> None:
+        self._emit("$abandon", metadata)
+
+    def view(self, metadata: dict | None = None) -> None:
+        self._emit("$view", metadata)
+
+    def refine(
+        self,
+        refinement_type: str | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        m = {**(metadata or {})}
+        if refinement_type is not None:
+            m["refinement_type"] = refinement_type
+        self._emit("$refine", m)
+
+    def followup(self, metadata: dict | None = None) -> None:
+        self._emit("$followup", metadata)
+
+    def rephrase(self, metadata: dict | None = None) -> None:
+        self._emit("$rephrase", metadata)
+
+    def undo(self, metadata: dict | None = None) -> None:
+        self._emit("$undo", metadata)
+
+    def share(
+        self,
+        channel: str | None = None,
+        edited_before_share: bool | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        m = {**(metadata or {})}
+        if channel is not None:
+            m["channel"] = channel
+        if edited_before_share is not None:
+            m["edited_before_share"] = edited_before_share
+        self._emit("$share", m)
+
+    def flag(
+        self,
+        reason: str | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        m = {**(metadata or {})}
+        if reason is not None:
+            m["reason"] = reason
+        self._emit("$flag", m)
+
+    def rate(
+        self,
+        value: float,
+        scale: str = "binary",
+        metadata: dict | None = None,
+    ) -> None:
+        m = {"value": value, "scale": scale, **(metadata or {})}
+        self._emit("$rate", m)
+
+    def escalate(self, metadata: dict | None = None) -> None:
+        self._emit("$escalate", metadata)
+
+    def post_accept_edit(
+        self,
+        edit_distance: float | None = None,
+        time_since_accept_ms: int | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        m = {**(metadata or {})}
+        if edit_distance is not None:
+            m["edit_distance"] = edit_distance
+        if time_since_accept_ms is not None:
+            m["time_since_accept_ms"] = time_since_accept_ms
+        self._emit("$post_accept_edit", m)
+
+
+class Feature:
+    """Scoped handle for an AI feature. Carries defaults so you don't
+    repeat prompt_id/model/user_id on every generation.
+
+        summarizer = client.feature("summarizer", model="gpt-4o")
+        gen = summarizer.generation("session-123")
+        gen.accept()
+    """
+
+    __slots__ = ("_client", "_defaults", "name")
+
+    def __init__(self, client: LitmusClient, name: str, defaults: dict):
+        self._client = client
+        self.name = name
+        self._defaults = {**defaults, "prompt_id": defaults.get("prompt_id", name)}
+
+    def generation(
+        self,
+        session_id: str,
+        user_id: str | None = None,
+        prompt_version: str | None = None,
+        metadata: dict | None = None,
+    ) -> Generation:
+        base_meta: dict = {"feature": self.name}
+        model = self._defaults.get("model")
+        if model:
+            base_meta["model"] = model
+
+        merged = {
+            **self._defaults,
+            "user_id": user_id or self._defaults.get("user_id"),
+            "prompt_version": prompt_version or self._defaults.get("prompt_version"),
+            "metadata": {
+                **base_meta,
+                **self._defaults.get("metadata", {}),
+                **(metadata or {}),
+            },
+        }
+        return self._client.generation(session_id, **merged)
+
+    def track(
+        self,
+        event_type: str,
+        session_id: str,
+        user_id: str | None = None,
+        metadata: dict | None = None,
+        **kwargs: object,
+    ) -> str | None:
+        return self._client.track(
+            event_type=event_type,
+            session_id=session_id,
+            user_id=user_id or self._defaults.get("user_id"),
+            prompt_id=kwargs.get("prompt_id") or self._defaults.get("prompt_id"),
+            metadata={
+                **self._defaults.get("metadata", {}),
+                "feature": self.name,
+                **(metadata or {}),
+            },
+            **{k: v for k, v in kwargs.items() if k != "prompt_id"},
+        )
+
+
+class LitmusClient:
+    """Litmus event client with background batching.
+
+    Args:
+        api_key: Your Litmus API key (ltm_pk_live_... or ltm_pk_test_...).
+        host: Ingest endpoint URL. Defaults to https://ingest.trylitmus.com.
+        max_queue_size: Max events buffered in memory before dropping. Default: 10000.
+        on_error: Callback(exception, batch) invoked on send failure.
+        flush_at: Batch size threshold that triggers an upload. Default: 100.
+        flush_interval: Seconds to wait before flushing a partial batch. Default: 0.5.
+        gzip: Compress payloads with gzip. Default: False.
+        max_retries: Max retry attempts per batch. Default: 3.
+        sync_mode: Send events inline (no background thread). Useful for
+                   serverless or testing. Default: False.
+        timeout: HTTP timeout in seconds. Default: 15.
+        threads: Number of consumer threads. Default: 1.
+        send: Actually send events (set False for dry-run). Default: True.
+        debug: Enable DEBUG-level logging. Default: False.
+        disabled: Silently drop all events. Default: False.
+    """
+
+    log = logging.getLogger("litmus")
+
+    def __init__(
+        self,
+        api_key: str,
+        host: str | None = None,
+        max_queue_size: int = 10_000,
+        on_error: Callable[[Exception, list[dict]], None] | None = None,
+        flush_at: int = 100,
+        flush_interval: float = 0.5,
+        gzip: bool = False,
+        max_retries: int = 3,
+        sync_mode: bool = False,
+        timeout: int = 15,
+        threads: int = 1,
+        send: bool = True,
+        debug: bool = False,
+        disabled: bool = False,
+    ):
+        self._queue: queue.Queue[dict] = queue.Queue(max_queue_size)
+        self.api_key = api_key
+        self.host = (host or DEFAULT_HOST).rstrip("/")
+        self.on_error = on_error
+        self.send = send
+        self.sync_mode = sync_mode
+        self.gzip = gzip
+        self.timeout = timeout
+        self.disabled = disabled
+        self.consumers: list[Consumer] | None = None
+
+        if debug:
+            logging.basicConfig()
+            self.log.setLevel(logging.DEBUG)
+
+        if sync_mode:
+            self.consumers = None
+        else:
+            if send:
+                atexit.register(self.join)
+
+            self.consumers = []
+            for _ in range(threads):
+                consumer = Consumer(
+                    queue=self._queue,
+                    api_key=self.api_key,
+                    host=self.host,
+                    on_error=on_error,
+                    flush_at=flush_at,
+                    flush_interval=flush_interval,
+                    use_gzip=gzip,
+                    retries=max_retries,
+                    timeout=timeout,
+                )
+                self.consumers.append(consumer)
+                if send:
+                    consumer.start()
+
+    # -- public API ----------------------------------------------------------
+
+    def track(
+        self,
+        event_type: str,
+        session_id: str,
+        user_id: str | None = None,
+        prompt_id: str | None = None,
+        prompt_version: str | None = None,
+        generation_id: str | None = None,
+        metadata: dict | None = None,
+        timestamp: datetime | None = None,
+    ) -> str | None:
+        """Enqueue a single event. Returns the event UUID or None if dropped."""
+        if self.disabled:
+            return None
+
+        ts = timestamp or datetime.now(tz=UTC)
+        event_id = str(uuid4())
+
+        msg: dict = {
+            "id": event_id,
+            "type": event_type,
+            "session_id": session_id,
+            "timestamp": ts.isoformat(),
+        }
+        if user_id:
+            msg["user_id"] = user_id
+        if prompt_id:
+            msg["prompt_id"] = prompt_id
+        if prompt_version:
+            msg["prompt_version"] = prompt_version
+        if generation_id:
+            msg["generation_id"] = generation_id
+
+        props = {"$lib": "litmus-python", "$lib_version": VERSION}
+        if metadata:
+            props.update(metadata)
+        msg["metadata"] = props
+
+        self.log.debug("queueing: %s", msg)
+
+        if not self.send:
+            return event_id
+
+        if self.sync_mode:
+            batch_post(
+                self.api_key,
+                host=self.host,
+                use_gzip=self.gzip,
+                timeout=self.timeout,
+                batch=[msg],
+            )
+            return event_id
+
+        try:
+            self._queue.put(msg, block=False)
+            return event_id
+        except queue.Full:
+            self.log.warning("litmus queue is full, event dropped")
+            return None
+
+    def generation(
+        self,
+        session_id: str,
+        user_id: str | None = None,
+        prompt_id: str | None = None,
+        prompt_version: str | None = None,
+        model: str | None = None,
+        metadata: dict | None = None,
+    ) -> Generation:
+        """Create a generation and return a handle for recording signals."""
+        generation_id = str(uuid4())
+        defaults = {
+            "user_id": user_id,
+            "prompt_id": prompt_id,
+            "prompt_version": prompt_version,
+            "model": model,
+            "metadata": metadata or {},
+        }
+
+        self.track(
+            event_type="$generation",
+            session_id=session_id,
+            user_id=user_id,
+            generation_id=generation_id,
+            prompt_id=prompt_id,
+            prompt_version=prompt_version,
+            metadata=metadata,
+        )
+
+        return Generation(self, session_id, generation_id, defaults)
+
+    def attach(
+        self,
+        generation_id: str,
+        session_id: str,
+        user_id: str | None = None,
+        prompt_id: str | None = None,
+        prompt_version: str | None = None,
+        metadata: dict | None = None,
+    ) -> Generation:
+        """Attach to an existing generation (e.g. one created by a frontend SDK).
+
+        Returns a Generation handle for recording signals without
+        re-emitting the $generation event. Use this when the generation
+        was already created by another SDK and you have the generation_id.
+
+            # Frontend created the generation, backend received the ID
+            gen = client.attach(request.generation_id, session_id)
+            gen.accept()  # backend-side signal
+        """
+        defaults = {
+            "user_id": user_id,
+            "prompt_id": prompt_id,
+            "prompt_version": prompt_version,
+            "metadata": metadata or {},
+        }
+        return Generation(self, session_id, generation_id, defaults)
+
+    def feature(
+        self,
+        name: str,
+        model: str | None = None,
+        user_id: str | None = None,
+        prompt_version: str | None = None,
+        metadata: dict | None = None,
+    ) -> Feature:
+        """Create a scoped feature handle that carries defaults."""
+        defaults = {
+            "prompt_id": name,
+            "model": model,
+            "user_id": user_id,
+            "prompt_version": prompt_version,
+            "metadata": metadata or {},
+        }
+        return Feature(self, name, defaults)
+
+    def flush(self) -> None:
+        """Block until the queue is fully drained."""
+        size = self._queue.qsize()
+        self._queue.join()
+        self.log.debug("flushed ~%d items", size)
+
+    def join(self) -> None:
+        """Stop consumer threads (call after flush)."""
+        if self.consumers:
+            for consumer in self.consumers:
+                consumer.pause()
+                try:
+                    consumer.join()
+                except RuntimeError:
+                    pass
+
+    def shutdown(self) -> None:
+        """Flush all pending events and stop consumer threads.
+        Call this before process exit in serverless environments."""
+        self.flush()
+        self.join()
