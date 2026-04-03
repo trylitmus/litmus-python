@@ -62,11 +62,6 @@ def mock_transport() -> Generator[CallLog, None, None]:
     req._client = old_client
 
 
-def _make_mock_client(log: CallLog) -> httpx.Client:
-    """Build an httpx.Client backed by a CallLog's MockTransport."""
-    return httpx.Client(transport=httpx.MockTransport(log.handler))
-
-
 class TestTrackSync:
     """sync_mode sends inline, no threads. Deterministic."""
 
@@ -142,9 +137,9 @@ class TestGeneration:
     def test_generation_emits_creation_and_signals(self, mock_transport: CallLog) -> None:
         client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
         gen = client.generation("s1", prompt_id="summarizer", user_id="u1")
-        gen.accept()
-        gen.edit(edit_distance=0.5)
-        gen.copy()
+        gen.event("$accept")
+        gen.event("$edit", edit_distance=0.5)
+        gen.event("$copy")
 
         events = mock_transport.events()
         types = [e["type"] for e in events]
@@ -157,10 +152,10 @@ class TestGeneration:
         assert len(gen_ids) == 1
         assert gen.id in gen_ids
 
-    def test_generation_rate(self, mock_transport: CallLog) -> None:
+    def test_event_with_metadata(self, mock_transport: CallLog) -> None:
         client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
         gen = client.generation("s1")
-        gen.rate(5, scale="5-star", metadata={"comment": "great"})
+        gen.event("$rate", value=5, scale="5-star", comment="great")
 
         events = mock_transport.events()
         rate_event = next(e for e in events if e["type"] == "$rate")
@@ -168,59 +163,51 @@ class TestGeneration:
         assert rate_event["metadata"]["scale"] == "5-star"
         assert rate_event["metadata"]["comment"] == "great"
 
-    def test_generation_share(self, mock_transport: CallLog) -> None:
+    def test_event_share(self, mock_transport: CallLog) -> None:
         client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
         gen = client.generation("s1")
-        gen.share(channel="slack", edited_before_share=True)
+        gen.event("$share", channel="slack", edited_before_share=True)
 
         events = mock_transport.events()
         share_event = next(e for e in events if e["type"] == "$share")
         assert share_event["metadata"]["channel"] == "slack"
         assert share_event["metadata"]["edited_before_share"] is True
 
-    def test_generation_flag(self, mock_transport: CallLog) -> None:
+    def test_event_flag(self, mock_transport: CallLog) -> None:
         client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
         gen = client.generation("s1")
-        gen.flag(reason="hallucination")
+        gen.event("$flag", reason="hallucination")
 
         events = mock_transport.events()
         flag_event = next(e for e in events if e["type"] == "$flag")
         assert flag_event["metadata"]["reason"] == "hallucination"
 
-    def test_generation_post_accept_edit(self, mock_transport: CallLog) -> None:
+    def test_event_post_accept_edit(self, mock_transport: CallLog) -> None:
         client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
         gen = client.generation("s1")
-        gen.post_accept_edit(edit_distance=0.2, time_since_accept_ms=5000)
+        gen.event("$post_accept_edit", edit_distance=0.2, time_since_accept_ms=5000)
 
         events = mock_transport.events()
         pae = next(e for e in events if e["type"] == "$post_accept_edit")
         assert pae["metadata"]["edit_distance"] == 0.2
         assert pae["metadata"]["time_since_accept_ms"] == 5000
 
-    def test_all_signal_methods(self, mock_transport: CallLog) -> None:
-        """Every signal method on Generation should produce an event."""
+    def test_custom_event(self, mock_transport: CallLog) -> None:
+        """Custom events work just like system events."""
         client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
         gen = client.generation("s1")
-        gen.accept()
-        gen.edit()
-        gen.regenerate()
-        gen.copy()
-        gen.abandon()
-        gen.view()
-        gen.refine()
-        gen.followup()
-        gen.rephrase()
-        gen.undo()
-        gen.share()
-        gen.flag()
-        gen.rate(1)
-        gen.escalate()
-        gen.post_accept_edit()
+        gen.event("my_custom_signal", score=0.9, source="manual")
 
         events = mock_transport.events()
-        types = {e["type"] for e in events}
-        expected = {
-            "$generation",
+        custom = next(e for e in events if e["type"] == "my_custom_signal")
+        assert custom["metadata"]["score"] == 0.9
+        assert custom["metadata"]["source"] == "manual"
+
+    def test_all_system_events(self, mock_transport: CallLog) -> None:
+        """Every system event type should work through gen.event()."""
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+        gen = client.generation("s1")
+        system_events = [
             "$accept",
             "$edit",
             "$regenerate",
@@ -236,7 +223,14 @@ class TestGeneration:
             "$rate",
             "$escalate",
             "$post_accept_edit",
-        }
+        ]
+        for evt in system_events:
+            gen.event(evt)
+
+        events = mock_transport.events()
+        types = {e["type"] for e in events}
+        # +1 for $generation from client.generation()
+        expected = {"$generation", *system_events}
         assert expected.issubset(types)
 
 
@@ -245,7 +239,7 @@ class TestFeature:
         client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
         feat = client.feature("content_gen", model="gpt-4o", user_id="u1")
         gen = feat.generation("s1")
-        gen.accept()
+        gen.event("$accept")
 
         events = mock_transport.events()
         gen_event = next(e for e in events if e["type"] == "$generation")
@@ -269,8 +263,8 @@ class TestAttach:
 
     def test_attach_does_not_emit_generation_event(self, mock_transport: CallLog) -> None:
         client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
-        gen = client.attach("existing-gen-id", "s1", user_id="u1")
-        gen.accept()
+        gen = client.attach("existing-gen-id", "s1")
+        gen.event("$accept")
 
         events = mock_transport.events()
         types = [e["type"] for e in events]
@@ -282,49 +276,122 @@ class TestAttach:
         gen = client.attach("backend-gen-uuid", "s1")
         assert gen.id == "backend-gen-uuid"
 
-        gen.edit(edit_distance=0.4)
-        gen.copy()
+        gen.event("$edit", edit_distance=0.4)
+        gen.event("$copy")
 
         events = mock_transport.events()
         for event in events:
             assert event["generation_id"] == "backend-gen-uuid"
 
-    def test_attach_carries_defaults(self, mock_transport: CallLog) -> None:
+    def test_attach_minimal_no_opts(self, mock_transport: CallLog) -> None:
+        """attach() needs only generation_id and session_id. No user_id needed."""
         client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
-        gen = client.attach(
-            "gen-123",
-            "s1",
-            user_id="u1",
-            prompt_id="summarizer",
-            metadata={"source": "backend"},
-        )
-        gen.accept()
+        gen = client.attach("gen-abc", "s1")
+        gen.event("$copy")
 
         event = mock_transport.events()[0]
-        assert event["user_id"] == "u1"
-        assert event["prompt_id"] == "summarizer"
-        assert event["metadata"]["source"] == "backend"
+        assert event["generation_id"] == "gen-abc"
+        assert event["session_id"] == "s1"
+        assert "user_id" not in event
 
-    def test_cross_sdk_flow(self, mock_transport: CallLog) -> None:
-        """Simulate the full backend-creates, frontend-attaches flow."""
+
+class TestCorrelation:
+    """Verify that generation() and attach() produce events that correlate
+    on generation_id. This is the core contract for cross-SDK usage:
+    backend emits $generation with prompt context, frontend emits behavioral
+    signals, everything joins on generation_id."""
+
+    def test_all_events_share_generation_id(self, mock_transport: CallLog) -> None:
+        """The fundamental correlation: every event from both generation()
+        and attach() references the same generation_id."""
         client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
 
         # Backend creates generation (emits $generation)
-        backend_gen = client.generation("s1", prompt_id="content_gen", user_id="u1")
+        backend_gen = client.generation(
+            "s1",
+            prompt_id="content_gen",
+            prompt_version="v2.3",
+            metadata={"model": "gpt-4o", "latency_ms": 420},
+        )
         generation_id = backend_gen.id
 
-        # Frontend attaches to same generation_id (no $generation emitted)
-        frontend_gen = client.attach(generation_id, "s1", user_id="u1")
-        frontend_gen.accept()
-        frontend_gen.edit(edit_distance=0.3)
+        # Frontend attaches, records behavioral signals (no $generation)
+        frontend_gen = client.attach(generation_id, "s1")
+        frontend_gen.event("$accept")
+        frontend_gen.event("$edit", edit_distance=0.3)
+        frontend_gen.event("$copy")
+
+        events = mock_transport.events()
+
+        # Every single event must share the same generation_id
+        gen_ids = {e["generation_id"] for e in events}
+        assert gen_ids == {generation_id}, (
+            f"Expected all events to share generation_id {generation_id}, got {gen_ids}"
+        )
+
+    def test_generation_carries_prompt_context(self, mock_transport: CallLog) -> None:
+        """$generation event (from backend) carries prompt_id, prompt_version,
+        and model metadata. Behavioral events (from frontend) don't need to."""
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+
+        backend_gen = client.generation(
+            "s1",
+            prompt_id="summarizer",
+            prompt_version="v3.1",
+            metadata={"model": "claude-sonnet", "token_count": 512},
+        )
+
+        frontend_gen = client.attach(backend_gen.id, "s1")
+        frontend_gen.event("$accept")
+
+        events = mock_transport.events()
+        gen_event = next(e for e in events if e["type"] == "$generation")
+        accept_event = next(e for e in events if e["type"] == "$accept")
+
+        # Backend $generation has full prompt context
+        assert gen_event["prompt_id"] == "summarizer"
+        assert gen_event["prompt_version"] == "v3.1"
+        assert gen_event["metadata"]["model"] == "claude-sonnet"
+        assert gen_event["metadata"]["token_count"] == 512
+
+        # Frontend behavioral event doesn't need prompt context,
+        # it correlates via generation_id
+        assert "prompt_id" not in accept_event
+        assert "prompt_version" not in accept_event
+
+    def test_exactly_one_generation_event(self, mock_transport: CallLog) -> None:
+        """No matter how many attach() calls, only one $generation is emitted."""
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+
+        gen = client.generation("s1", prompt_id="chat-v1")
+
+        # Multiple "consumers" attach to the same generation
+        handle_a = client.attach(gen.id, "s1")
+        handle_b = client.attach(gen.id, "s1")
+
+        handle_a.event("$view")
+        handle_b.event("$copy")
+        handle_a.event("$accept")
 
         events = mock_transport.events()
         gen_events = [e for e in events if e["type"] == "$generation"]
-        assert len(gen_events) == 1  # only one $generation
+        assert len(gen_events) == 1
 
-        # All events share the same generation_id
-        gen_ids = {e["generation_id"] for e in events}
-        assert gen_ids == {generation_id}
+        # But all 4 events (1 gen + 3 behavioral) share the same id
+        assert len(events) == 4
+        assert all(e["generation_id"] == gen.id for e in events)
+
+    def test_session_id_consistent(self, mock_transport: CallLog) -> None:
+        """Both sides must use the same session_id for the join to work."""
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+
+        gen = client.generation("conversation-42", prompt_id="chat")
+        frontend = client.attach(gen.id, "conversation-42")
+        frontend.event("$accept")
+
+        events = mock_transport.events()
+        session_ids = {e["session_id"] for e in events}
+        assert session_ids == {"conversation-42"}
 
 
 class TestRetries:
@@ -368,7 +435,6 @@ class TestThreadedIntegration:
         )
         for i in range(5):
             client.track(event_type="$view", session_id=f"s{i}")
-        # flush_at=5 triggers the batch, queue.join() waits for delivery
         client.shutdown()
 
         assert len(mock_transport.calls) >= 1
@@ -380,7 +446,6 @@ class TestThreadedIntegration:
 
         log = CallLog()
         log.add_response(500, {"error": "boom"})
-        # Second call gets the default 202
         old_client = req._client
         req._client = httpx.Client(transport=httpx.MockTransport(log.handler))
 
@@ -392,8 +457,6 @@ class TestThreadedIntegration:
                 max_retries=2,
             )
             client.track(event_type="$accept", session_id="s1")
-            # queue.join() blocks until the consumer marks the item done,
-            # which includes the retry backoff + second attempt
             client.shutdown()
 
             assert len(log.calls) == 2
@@ -404,9 +467,7 @@ class TestThreadedIntegration:
 
 class TestQueueFull:
     def test_returns_none_when_full(self) -> None:
-        # Tiny queue, consumers paused
         client = LitmusClient(api_key="ltm_pk_test_abc", max_queue_size=1, send=False)
-        # Flip send on and stuff the queue manually
         client.send = True
         client._queue.put({"fake": True})
         result = client.track(event_type="$view", session_id="s1")

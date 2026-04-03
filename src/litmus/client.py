@@ -9,8 +9,8 @@ batch_post() ships them to /v1/events.
 
     client = LitmusClient(api_key="ltm_pk_live_...")
     gen = client.generation("session-123", prompt_id="content_gen")
-    gen.accept()
-    gen.edit(edit_distance=0.3)
+    gen.event("$accept")
+    gen.event("$edit", edit_distance=0.3)
     client.shutdown()
 """
 
@@ -21,6 +21,7 @@ import logging
 import queue
 from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Literal
 from uuid import uuid4
 
 from litmus.consumer import Consumer
@@ -29,35 +30,34 @@ from litmus.version import VERSION
 
 log = logging.getLogger("litmus")
 
-# Same system events the TS SDK knows about
-SYSTEM_EVENTS = frozenset(
-    [
-        "$generation",
-        "$regenerate",
-        "$copy",
-        "$edit",
-        "$abandon",
-        "$accept",
-        "$view",
-        "$partial_copy",
-        "$refine",
-        "$followup",
-        "$rephrase",
-        "$undo",
-        "$share",
-        "$flag",
-        "$rate",
-        "$escalate",
-        "$switch_model",
-        "$retry_context",
-        "$post_accept_edit",
-        "$blur",
-        "$return",
-        "$scroll_regression",
-        "$navigate",
-        "$interrupt",
-    ]
-)
+# Literal union gives autocomplete in editors; Union[..., str] still accepts custom events.
+SystemEvent = Literal[
+    "$generation",
+    "$regenerate",
+    "$copy",
+    "$edit",
+    "$abandon",
+    "$accept",
+    "$view",
+    "$partial_copy",
+    "$refine",
+    "$followup",
+    "$rephrase",
+    "$undo",
+    "$share",
+    "$flag",
+    "$rate",
+    "$escalate",
+    "$switch_model",
+    "$retry_context",
+    "$post_accept_edit",
+    "$blur",
+    "$return",
+    "$scroll_regression",
+    "$navigate",
+    "$interrupt",
+]
+EventType = SystemEvent | str
 
 
 class Generation:
@@ -65,8 +65,9 @@ class Generation:
     signals without re-threading IDs on every call.
 
         gen = client.generation("session-123")
-        gen.accept()
-        gen.edit(edit_distance=0.3)
+        gen.event("$accept")
+        gen.event("$edit", edit_distance=0.3)
+        gen.event("my_custom_signal", whatever=True)
     """
 
     __slots__ = ("id", "_session_id", "_defaults", "_client")
@@ -83,8 +84,15 @@ class Generation:
         self.id = generation_id
         self._defaults = defaults
 
-    def _emit(self, event_type: str, metadata: dict | None = None) -> None:
-        merged = {**self._defaults.get("metadata", {}), **(metadata or {})}
+    def event(self, event_type: EventType, **metadata: object) -> None:
+        """Record a behavioral signal against this generation.
+
+        gen.event("$accept")
+        gen.event("$edit", edit_distance=0.3)
+        gen.event("$share", channel="slack")
+        gen.event("my_custom_signal", whatever=True)
+        """
+        merged = {**self._defaults.get("metadata", {}), **metadata}
         self._client.track(
             event_type=event_type,
             session_id=self._session_id,
@@ -94,98 +102,6 @@ class Generation:
             generation_id=self.id,
             metadata=merged if merged else None,
         )
-
-    def accept(self, metadata: dict | None = None) -> None:
-        self._emit("$accept", metadata)
-
-    def edit(
-        self,
-        edit_distance: float | None = None,
-        metadata: dict | None = None,
-    ) -> None:
-        m = {**(metadata or {})}
-        if edit_distance is not None:
-            m["edit_distance"] = edit_distance
-        self._emit("$edit", m)
-
-    def regenerate(self, metadata: dict | None = None) -> None:
-        self._emit("$regenerate", metadata)
-
-    def copy(self, metadata: dict | None = None) -> None:
-        self._emit("$copy", metadata)
-
-    def abandon(self, metadata: dict | None = None) -> None:
-        self._emit("$abandon", metadata)
-
-    def view(self, metadata: dict | None = None) -> None:
-        self._emit("$view", metadata)
-
-    def refine(
-        self,
-        refinement_type: str | None = None,
-        metadata: dict | None = None,
-    ) -> None:
-        m = {**(metadata or {})}
-        if refinement_type is not None:
-            m["refinement_type"] = refinement_type
-        self._emit("$refine", m)
-
-    def followup(self, metadata: dict | None = None) -> None:
-        self._emit("$followup", metadata)
-
-    def rephrase(self, metadata: dict | None = None) -> None:
-        self._emit("$rephrase", metadata)
-
-    def undo(self, metadata: dict | None = None) -> None:
-        self._emit("$undo", metadata)
-
-    def share(
-        self,
-        channel: str | None = None,
-        edited_before_share: bool | None = None,
-        metadata: dict | None = None,
-    ) -> None:
-        m = {**(metadata or {})}
-        if channel is not None:
-            m["channel"] = channel
-        if edited_before_share is not None:
-            m["edited_before_share"] = edited_before_share
-        self._emit("$share", m)
-
-    def flag(
-        self,
-        reason: str | None = None,
-        metadata: dict | None = None,
-    ) -> None:
-        m = {**(metadata or {})}
-        if reason is not None:
-            m["reason"] = reason
-        self._emit("$flag", m)
-
-    def rate(
-        self,
-        value: float,
-        scale: str = "binary",
-        metadata: dict | None = None,
-    ) -> None:
-        m = {"value": value, "scale": scale, **(metadata or {})}
-        self._emit("$rate", m)
-
-    def escalate(self, metadata: dict | None = None) -> None:
-        self._emit("$escalate", metadata)
-
-    def post_accept_edit(
-        self,
-        edit_distance: float | None = None,
-        time_since_accept_ms: int | None = None,
-        metadata: dict | None = None,
-    ) -> None:
-        m = {**(metadata or {})}
-        if edit_distance is not None:
-            m["edit_distance"] = edit_distance
-        if time_since_accept_ms is not None:
-            m["time_since_accept_ms"] = time_since_accept_ms
-        self._emit("$post_accept_edit", m)
 
 
 class Feature:
@@ -230,7 +146,7 @@ class Feature:
 
     def track(
         self,
-        event_type: str,
+        event_type: EventType,
         session_id: str,
         user_id: str | None = None,
         metadata: dict | None = None,
@@ -332,7 +248,7 @@ class LitmusClient:
 
     def track(
         self,
-        event_type: str,
+        event_type: EventType,
         session_id: str,
         user_id: str | None = None,
         prompt_id: str | None = None,
@@ -430,15 +346,15 @@ class LitmusClient:
         prompt_version: str | None = None,
         metadata: dict | None = None,
     ) -> Generation:
-        """Attach to an existing generation (e.g. one created by a frontend SDK).
+        """Attach to an existing generation without re-emitting $generation.
 
-        Returns a Generation handle for recording signals without
-        re-emitting the $generation event. Use this when the generation
-        was already created by another SDK and you have the generation_id.
+        Use this when the generation was already created (by this service,
+        another service, or a frontend SDK) and you have the generation_id.
+        prompt_id/prompt_version are optional here because the $generation
+        event already carries that context, everything joins on generation_id.
 
-            # Frontend created the generation, backend received the ID
             gen = client.attach(request.generation_id, session_id)
-            gen.accept()  # backend-side signal
+            gen.accept()  # server-side behavioral signal
         """
         defaults = {
             "user_id": user_id,
