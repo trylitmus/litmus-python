@@ -17,7 +17,7 @@ import pytest
 from litmus import LitmusClient
 from litmus.version import VERSION
 
-INGEST_URL = "https://events.trylitmus.app/v1/events"
+INGEST_URL = "https://ingest.trylitmus.app/v1/events"
 
 
 class CallLog:

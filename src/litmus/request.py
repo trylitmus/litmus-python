@@ -18,7 +18,7 @@ from litmus.version import VERSION
 
 log = logging.getLogger("litmus")
 
-DEFAULT_HOST = "https://events.trylitmus.app"
+DEFAULT_HOST = "https://ingest.trylitmus.app"
 USER_AGENT = f"litmus-python/{VERSION}"
 
 
