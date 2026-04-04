@@ -171,7 +171,7 @@ class LitmusClient:
 
     Args:
         api_key: Your Litmus API key (ltm_pk_live_... or ltm_pk_test_...).
-        host: Ingest endpoint URL. Defaults to https://ingest.trylitmus.com.
+        host: Ingest endpoint URL. Defaults to https://events.trylitmus.app.
         max_queue_size: Max events buffered in memory before dropping. Default: 10000.
         on_error: Callback(exception, batch) invoked on send failure.
         flush_at: Batch size threshold that triggers an upload. Default: 100.

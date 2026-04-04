@@ -15,8 +15,9 @@ import httpx
 import pytest
 
 from litmus import LitmusClient
+from litmus.version import VERSION
 
-INGEST_URL = "https://ingest.trylitmus.com/v1/events"
+INGEST_URL = "https://events.trylitmus.app/v1/events"
 
 
 class CallLog:
@@ -96,6 +97,7 @@ class TestTrackSync:
         assert event["generation_id"] == "gen-123"
         assert event["metadata"]["edit_distance"] == 0.3
         assert event["metadata"]["$lib"] == "litmus-python"
+        assert event["metadata"]["$lib_version"] == VERSION
 
     def test_bearer_token(self, mock_transport: CallLog) -> None:
         client = LitmusClient(api_key="ltm_pk_test_secret", sync_mode=True)
