@@ -1,0 +1,35 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Verify version matches tag
+        run: |
+          tag_version="${GITHUB_REF#refs/tags/v}"
+          pkg_version=$(uv run python -c "from litmus.version import VERSION; print(VERSION)")
+          if [ "$pkg_version" != "$tag_version" ]; then
+            echo "::error::Version mismatch: package has $pkg_version but tag is $tag_version"
+            exit 1
+          fi
+
+      - name: Build
+        run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
