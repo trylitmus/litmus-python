@@ -25,10 +25,12 @@ from typing import Literal
 from uuid import uuid4
 
 from litmus.consumer import Consumer
+from litmus.environment import collect_startup_metadata
 from litmus.request import DEFAULT_HOST, batch_post
 from litmus.version import VERSION
 
 log = logging.getLogger("litmus")
+
 
 # Literal union gives autocomplete in editors; Union[..., str] still accepts custom events.
 SystemEvent = Literal[
@@ -56,6 +58,7 @@ SystemEvent = Literal[
     "$scroll_regression",
     "$navigate",
     "$interrupt",
+    "$startup",
 ]
 EventType = SystemEvent | str
 
@@ -243,6 +246,18 @@ class LitmusClient:
                 self.consumers.append(consumer)
                 if send:
                     consumer.start()
+
+        # Fire $startup so the ingest server knows the SDK initialized.
+        # Fastest possible signal for the setup wizard (no user interaction
+        # required) and carries environment metadata for debugging.
+        # Skip in sync_mode to avoid blocking the constructor with an HTTP
+        # call (sync_mode is for serverless where cold start latency matters).
+        if not sync_mode and not disabled:
+            self.track(
+                event_type="$startup",
+                session_id="",
+                metadata=collect_startup_metadata(),
+            )
 
     # -- public API ----------------------------------------------------------
 

@@ -416,7 +416,8 @@ class TestThreadedIntegration:
     """Verify the actual threading path works end-to-end."""
 
     def test_threaded_delivery(self, mock_transport: CallLog) -> None:
-        """shutdown() -> flush() -> queue.join() is the sync primitive."""
+        """shutdown() -> flush() -> queue.join() is the sync primitive.
+        The constructor fires a $startup event, so we expect at least 2 calls."""
         client = LitmusClient(
             api_key="ltm_pk_test_abc",
             flush_at=1,
@@ -425,9 +426,13 @@ class TestThreadedIntegration:
         event_id = client.track(event_type="$accept", session_id="s1")
         client.shutdown()
 
-        assert len(mock_transport.calls) >= 1
-        body = json.loads(mock_transport.calls[0].content)
-        assert body["events"][0]["id"] == event_id
+        # $startup + $accept = at least 2 calls
+        assert len(mock_transport.calls) >= 2
+        events = mock_transport.events()
+        accept_event = next(e for e in events if e["type"] == "$accept")
+        assert accept_event["id"] == event_id
+        # $startup is also present
+        assert any(e["type"] == "$startup" for e in events)
 
     def test_threaded_batching(self, mock_transport: CallLog) -> None:
         client = LitmusClient(
@@ -440,8 +445,10 @@ class TestThreadedIntegration:
         client.shutdown()
 
         assert len(mock_transport.calls) >= 1
-        body = json.loads(mock_transport.calls[0].content)
-        assert len(body["events"]) == 5
+        # 5 user events + 1 $startup = 6 total, batched in groups of 5
+        events = mock_transport.events()
+        view_events = [e for e in events if e["type"] == "$view"]
+        assert len(view_events) == 5
 
     def test_threaded_retry_on_500(self) -> None:
         import litmus.request as req
@@ -461,10 +468,44 @@ class TestThreadedIntegration:
             client.track(event_type="$accept", session_id="s1")
             client.shutdown()
 
-            assert len(log.calls) == 2
+            # $startup hits the 500 first (retry succeeds with 202),
+            # then $accept also sends. At least 3 calls total.
+            assert len(log.calls) >= 3
         finally:
             req._client.close()
             req._client = old_client
+
+
+class TestStartup:
+    """$startup fires automatically in threaded mode with env metadata."""
+
+    def test_startup_fires_in_threaded_mode(self, mock_transport: CallLog) -> None:
+        client = LitmusClient(
+            api_key="ltm_pk_test_abc",
+            flush_at=1,
+            flush_interval=0.1,
+        )
+        client.shutdown()
+
+        events = mock_transport.events()
+        startup = next((e for e in events if e["type"] == "$startup"), None)
+        assert startup is not None
+        assert startup["session_id"] == ""
+        assert startup["metadata"]["$lib"] == "litmus-python"
+        assert "platform" in startup["metadata"]
+        assert "python_version" in startup["metadata"]
+        assert "runtime" in startup["metadata"]
+
+    def test_startup_skipped_in_sync_mode(self, mock_transport: CallLog) -> None:
+        """sync_mode is for serverless; $startup would block the constructor."""
+        LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+        assert len(mock_transport.calls) == 0
+
+    def test_startup_skipped_when_disabled(self) -> None:
+        client = LitmusClient(api_key="ltm_pk_test_abc", disabled=True, send=False)
+        # disabled clients drop everything, track() returns None
+        result = client.track(event_type="$accept", session_id="s1")
+        assert result is None
 
 
 class TestQueueFull:
