@@ -36,7 +36,7 @@ class Consumer(Thread):
         api_key: str,
         host: str | None = None,
         on_error: Callable[[Exception, list[dict]], None] | None = None,
-        flush_at: int = 100,
+        flush_at: int = 10,
         flush_interval: float = 0.5,
         use_gzip: bool = False,
         retries: int = 10,

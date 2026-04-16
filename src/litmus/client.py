@@ -53,6 +53,7 @@ SystemEvent = Literal[
     "$switch_model",
     "$retry_context",
     "$post_accept_edit",
+    "$sessionend",
     "$blur",
     "$return",
     "$scroll_regression",
@@ -105,6 +106,32 @@ class Generation:
             generation_id=self.id,
             metadata=merged if merged else None,
         )
+
+    def edit(self, before: str, after: str, **metadata: object) -> None:
+        """Record that the user modified the output before using it.
+
+        Send the raw before/after text. The backend computes edit distance,
+        diff classification, and derived metrics.
+        """
+        self.event("$edit", before=before, after=after, **metadata)
+
+    def accept(self, **metadata: object) -> None:
+        """User used the output as-is."""
+        self.event("$accept", **metadata)
+
+    def copy(self, **metadata: object) -> None:
+        """User copied the output."""
+        self.event("$copy", **metadata)
+
+    def regenerate(self, **metadata: object) -> None:
+        """User requested a new output. Fire BEFORE creating the next generation."""
+        self.event("$regenerate", **metadata)
+
+    def share(self, channel: str | None = None, **metadata: object) -> None:
+        """User shared the output."""
+        if channel:
+            metadata["channel"] = channel
+        self.event("$share", **metadata)
 
 
 class Feature:
@@ -271,6 +298,14 @@ class LitmusClient:
         generation_id: str | None = None,
         metadata: dict | None = None,
         timestamp: datetime | None = None,
+        model: str | None = None,
+        provider: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        total_tokens: int | None = None,
+        duration_ms: int | None = None,
+        ttft_ms: int | None = None,
+        cost: float | None = None,
     ) -> str | None:
         """Enqueue a single event. Returns the event UUID or None if dropped."""
         if self.disabled:
@@ -293,6 +328,23 @@ class LitmusClient:
             msg["prompt_version"] = prompt_version
         if generation_id:
             msg["generation_id"] = generation_id
+
+        if model:
+            msg["model"] = model
+        if provider:
+            msg["provider"] = provider
+        if input_tokens is not None:
+            msg["input_tokens"] = input_tokens
+        if output_tokens is not None:
+            msg["output_tokens"] = output_tokens
+        if total_tokens is not None:
+            msg["total_tokens"] = total_tokens
+        if duration_ms is not None:
+            msg["duration_ms"] = duration_ms
+        if ttft_ms is not None:
+            msg["ttft_ms"] = ttft_ms
+        if cost is not None:
+            msg["cost"] = cost
 
         props = {"$lib": "litmus-python", "$lib_version": VERSION}
         if metadata:
@@ -328,10 +380,25 @@ class LitmusClient:
         prompt_id: str | None = None,
         prompt_version: str | None = None,
         model: str | None = None,
+        provider: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        total_tokens: int | None = None,
+        duration_ms: int | None = None,
+        ttft_ms: int | None = None,
+        cost: float | None = None,
         metadata: dict | None = None,
+        generation_id: str | None = None,
     ) -> Generation:
-        """Create a generation and return a handle for recording signals."""
-        generation_id = str(uuid4())
+        """Create a generation and return a handle for recording signals.
+
+        Pass ``generation_id`` when the caller has already minted an id
+        (e.g. to correlate with an OTel/OpenRouter trace broadcast). When
+        omitted, a fresh UUID4 is used. The id is emitted on the
+        ``$generation`` event, so downstream joins work either way.
+        """
+        if generation_id is None:
+            generation_id = str(uuid4())
         defaults = {
             "user_id": user_id,
             "prompt_id": prompt_id,
@@ -348,6 +415,14 @@ class LitmusClient:
             prompt_id=prompt_id,
             prompt_version=prompt_version,
             metadata=metadata,
+            model=model,
+            provider=provider,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            duration_ms=duration_ms,
+            ttft_ms=ttft_ms,
+            cost=cost,
         )
 
         return Generation(self, session_id, generation_id, defaults)

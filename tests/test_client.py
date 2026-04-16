@@ -260,6 +260,95 @@ class TestFeature:
         assert events[0]["user_id"] == "u1"
 
 
+class TestGenerationIdOverride:
+    """generation() accepts an externally-minted generation_id so callers
+    can correlate the $generation event with ids they already emit elsewhere
+    (e.g. OTel span metadata broadcast by OpenRouter)."""
+
+    def test_uses_provided_generation_id(self, mock_transport: CallLog) -> None:
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+        gen = client.generation("s1", prompt_id="chat", generation_id="external-uuid")
+        assert gen.id == "external-uuid"
+
+        gen.event("$accept")
+        events = mock_transport.events()
+        assert all(e["generation_id"] == "external-uuid" for e in events)
+
+    def test_default_generates_uuid_when_absent(self, mock_transport: CallLog) -> None:
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+        gen = client.generation("s1")
+        # UUID4 string: 36 chars, 4 hyphens
+        assert len(gen.id) == 36
+        assert gen.id.count("-") == 4
+
+
+class TestGenerationTopLevelFields:
+    """generation() forwards model, provider, tokens, cost, latency as
+    TOP-LEVEL wire fields on the $generation event. The ingest server
+    stores these in dedicated columns (model TEXT, provider TEXT, etc.)
+    so dashboards can query them without JSONB lookups.
+
+    Regression guard for the v0.4.0 bug where these were accepted as
+    kwargs but silently dropped before send."""
+
+    def test_model_is_top_level(self, mock_transport: CallLog) -> None:
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+        client.generation("s1", prompt_id="chat", model="claude-sonnet-4-20250514")
+
+        event = next(e for e in mock_transport.events() if e["type"] == "$generation")
+        assert event["model"] == "claude-sonnet-4-20250514"
+        # Must NOT be in metadata — that was the old path we're moving off.
+        assert event["metadata"].get("model") is None
+
+    def test_provider_and_usage_are_top_level(self, mock_transport: CallLog) -> None:
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+        client.generation(
+            "s1",
+            prompt_id="chat",
+            model="gpt-4o",
+            provider="openai",
+            input_tokens=120,
+            output_tokens=340,
+            total_tokens=460,
+            duration_ms=1850,
+            ttft_ms=240,
+            cost=0.0042,
+        )
+
+        event = next(e for e in mock_transport.events() if e["type"] == "$generation")
+        assert event["model"] == "gpt-4o"
+        assert event["provider"] == "openai"
+        assert event["input_tokens"] == 120
+        assert event["output_tokens"] == 340
+        assert event["total_tokens"] == 460
+        assert event["duration_ms"] == 1850
+        assert event["ttft_ms"] == 240
+        assert event["cost"] == 0.0042
+
+    def test_optional_fields_omitted_when_none(self, mock_transport: CallLog) -> None:
+        """None-valued fields are dropped from the wire payload entirely —
+        the ingest server treats missing and null the same, but we keep
+        payloads lean."""
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+        client.generation("s1", prompt_id="chat")
+
+        event = next(e for e in mock_transport.events() if e["type"] == "$generation")
+        for key in ("model", "provider", "input_tokens", "output_tokens",
+                    "total_tokens", "duration_ms", "ttft_ms", "cost"):
+            assert key not in event, f"{key} should be omitted when None"
+
+    def test_feature_forwards_model_top_level(self, mock_transport: CallLog) -> None:
+        """Feature-scoped defaults also end up as top-level wire fields so
+        dashboards using feature() get the same model column as callers
+        using generation() directly."""
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+        feat = client.feature("summarizer", model="claude-haiku-4")
+        feat.generation("s1")
+
+        event = next(e for e in mock_transport.events() if e["type"] == "$generation")
+        assert event["model"] == "claude-haiku-4"
+
+
 class TestAttach:
     """attach() returns a Generation handle without emitting $generation."""
 
