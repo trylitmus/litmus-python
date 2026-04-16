@@ -198,7 +198,7 @@ class LitmusClient:
         host: str | None = None,
         max_queue_size: int = 10_000,
         on_error: Callable[[Exception, list[dict]], None] | None = None,
-        flush_at: int = 100,
+        flush_at: int = 10,
         flush_interval: float = 0.5,
         gzip: bool = False,
         max_retries: int = 3,
