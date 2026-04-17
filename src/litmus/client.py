@@ -88,13 +88,33 @@ class Generation:
         self.id = generation_id
         self._defaults = defaults
 
-    def event(self, event_type: EventType, **metadata: object) -> None:
+    def event(
+        self,
+        event_type: EventType,
+        *,
+        model: str | None = None,
+        provider: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        total_tokens: int | None = None,
+        duration_ms: int | None = None,
+        ttft_ms: int | None = None,
+        cost: float | None = None,
+        **metadata: object,
+    ) -> None:
         """Record a behavioral signal against this generation.
 
+        Wire-level fields (model, provider, tokens, duration_ms, ttft_ms,
+        cost) go as top-level event properties — the OpenAPI contract
+        defines them there, and downstream analytics (BQI, dashboards)
+        query them as real Postgres columns, not JSONB keys.
+
+        Everything else passed via **kwargs lands in metadata.
+
         gen.event("$accept")
-        gen.event("$edit", edit_distance=0.3)
-        gen.event("$share", channel="slack")
-        gen.event("my_custom_signal", whatever=True)
+        gen.event("$generation", model="gpt-4o", input_tokens=150)
+        gen.event("$edit", edit_distance=0.3)  # lands in metadata
+        gen.event("$share", channel="slack")   # lands in metadata
         """
         merged = {**self._defaults.get("metadata", {}), **metadata}
         self._client.track(
@@ -105,6 +125,14 @@ class Generation:
             prompt_version=self._defaults.get("prompt_version"),
             generation_id=self.id,
             metadata=merged if merged else None,
+            model=model,
+            provider=provider,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            duration_ms=duration_ms,
+            ttft_ms=ttft_ms,
+            cost=cost,
         )
 
     def edit(self, before: str, after: str, **metadata: object) -> None:
@@ -155,44 +183,87 @@ class Feature:
         session_id: str,
         user_id: str | None = None,
         prompt_version: str | None = None,
+        model: str | None = None,
+        provider: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        total_tokens: int | None = None,
+        duration_ms: int | None = None,
+        ttft_ms: int | None = None,
+        cost: float | None = None,
         metadata: dict | None = None,
+        generation_id: str | None = None,
     ) -> Generation:
-        base_meta: dict = {"feature": self.name}
-        model = self._defaults.get("model")
-        if model:
-            base_meta["model"] = model
+        """Create a generation using this feature's defaults.
 
-        merged = {
-            **self._defaults,
-            "user_id": user_id or self._defaults.get("user_id"),
-            "prompt_version": prompt_version or self._defaults.get("prompt_version"),
-            "metadata": {
-                **base_meta,
+        Per-call kwargs (model, provider, tokens, latency, cost) win over
+        the feature-scoped default. Wire-level fields are forwarded at the
+        top level — they land in real Postgres columns, not in metadata.
+        """
+        return self._client.generation(
+            session_id=session_id,
+            user_id=user_id or self._defaults.get("user_id"),
+            prompt_id=self._defaults.get("prompt_id"),
+            prompt_version=prompt_version or self._defaults.get("prompt_version"),
+            model=model or self._defaults.get("model"),
+            provider=provider or self._defaults.get("provider"),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            duration_ms=duration_ms,
+            ttft_ms=ttft_ms,
+            cost=cost,
+            metadata={
+                "feature": self.name,
                 **self._defaults.get("metadata", {}),
                 **(metadata or {}),
             },
-        }
-        return self._client.generation(session_id, **merged)
+            generation_id=generation_id,
+        )
 
     def track(
         self,
         event_type: EventType,
         session_id: str,
         user_id: str | None = None,
+        prompt_id: str | None = None,
+        prompt_version: str | None = None,
+        generation_id: str | None = None,
+        model: str | None = None,
+        provider: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        total_tokens: int | None = None,
+        duration_ms: int | None = None,
+        ttft_ms: int | None = None,
+        cost: float | None = None,
         metadata: dict | None = None,
-        **kwargs: object,
     ) -> str | None:
+        """Track an event scoped to this feature.
+
+        All wire-level fields forward at the top level so the ingest server
+        can write them to typed columns. feature name always tags metadata.
+        """
         return self._client.track(
             event_type=event_type,
             session_id=session_id,
             user_id=user_id or self._defaults.get("user_id"),
-            prompt_id=kwargs.get("prompt_id") or self._defaults.get("prompt_id"),
+            prompt_id=prompt_id or self._defaults.get("prompt_id"),
+            prompt_version=prompt_version or self._defaults.get("prompt_version"),
+            generation_id=generation_id,
+            model=model or self._defaults.get("model"),
+            provider=provider or self._defaults.get("provider"),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            duration_ms=duration_ms,
+            ttft_ms=ttft_ms,
+            cost=cost,
             metadata={
                 **self._defaults.get("metadata", {}),
                 "feature": self.name,
                 **(metadata or {}),
             },
-            **{k: v for k, v in kwargs.items() if k != "prompt_id"},
         )
 
 
@@ -458,6 +529,7 @@ class LitmusClient:
         self,
         name: str,
         model: str | None = None,
+        provider: str | None = None,
         user_id: str | None = None,
         prompt_version: str | None = None,
         metadata: dict | None = None,
@@ -466,6 +538,7 @@ class LitmusClient:
         defaults = {
             "prompt_id": name,
             "model": model,
+            "provider": provider,
             "user_id": user_id,
             "prompt_version": prompt_version,
             "metadata": metadata or {},

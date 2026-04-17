@@ -247,7 +247,9 @@ class TestFeature:
         gen_event = next(e for e in events if e["type"] == "$generation")
         assert gen_event["user_id"] == "u1"
         assert gen_event["metadata"]["feature"] == "content_gen"
-        assert gen_event["metadata"]["model"] == "gpt-4o"
+        # model is a wire-level field — goes top-level, NOT duplicated into metadata.
+        assert gen_event["model"] == "gpt-4o"
+        assert "model" not in gen_event["metadata"]
 
     def test_feature_track(self, mock_transport: CallLog) -> None:
         client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
@@ -355,6 +357,116 @@ class TestGenerationTopLevelFields:
 
         event = next(e for e in mock_transport.events() if e["type"] == "$generation")
         assert event["model"] == "claude-haiku-4"
+
+
+# All wire-level fields the ingest server writes to typed Postgres columns.
+# The SDK must surface them at the top of the JSON payload — NOT in metadata.
+WIRE_FIELDS = (
+    "model",
+    "provider",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "duration_ms",
+    "ttft_ms",
+    "cost",
+)
+
+
+class TestWireFieldsEveryEntryPoint:
+    """Regression guard for the v0.5.0 bug where Feature.generation() and
+    Feature.track() dropped wire fields or duplicated them into metadata.
+
+    Every public entry point that can emit wire fields must:
+      1. Serialize them at the top of the event JSON (not nested in metadata).
+      2. NOT duplicate them into metadata alongside the top-level value.
+
+    If you add a new wire field to the contract, add it here and to the
+    matching serializer in client.py."""
+
+    _SAMPLE = {
+        "model": "gpt-4o",
+        "provider": "openai",
+        "input_tokens": 120,
+        "output_tokens": 340,
+        "total_tokens": 460,
+        "duration_ms": 1850,
+        "ttft_ms": 240,
+        "cost": 0.0042,
+    }
+
+    def _assert_top_level_no_leak(self, event: dict) -> None:
+        meta = event.get("metadata", {})
+        for key, expected in self._SAMPLE.items():
+            assert event.get(key) == expected, (
+                f"{key} missing or wrong at top level: got {event.get(key)!r}, "
+                f"expected {expected!r}"
+            )
+            assert key not in meta, f"{key} leaked into metadata — breaks typed column path"
+
+    def test_track_serializes_wire_fields(self, mock_transport: CallLog) -> None:
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+        client.track(event_type="$generation", session_id="s1", **self._SAMPLE)
+        event = mock_transport.events()[0]
+        self._assert_top_level_no_leak(event)
+
+    def test_generation_serializes_wire_fields(self, mock_transport: CallLog) -> None:
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+        client.generation("s1", prompt_id="chat", **self._SAMPLE)
+        event = next(e for e in mock_transport.events() if e["type"] == "$generation")
+        self._assert_top_level_no_leak(event)
+
+    def test_gen_event_serializes_wire_fields(self, mock_transport: CallLog) -> None:
+        """Custom events on an existing Generation can carry wire fields too
+        (e.g. $switch_model mid-stream)."""
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+        gen = client.generation("s1", prompt_id="chat")
+        gen.event("$switch_model", **self._SAMPLE)
+        event = next(e for e in mock_transport.events() if e["type"] == "$switch_model")
+        self._assert_top_level_no_leak(event)
+
+    def test_feature_generation_serializes_wire_fields(self, mock_transport: CallLog) -> None:
+        """Feature-scoped generation must forward per-call wire fields, not
+        just the feature's defaults. This is the path OpenRouter integrations
+        use to pass back measured tokens/cost/latency."""
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+        feat = client.feature("summarizer")
+        feat.generation("s1", **self._SAMPLE)
+        event = next(e for e in mock_transport.events() if e["type"] == "$generation")
+        self._assert_top_level_no_leak(event)
+
+    def test_feature_track_serializes_wire_fields(self, mock_transport: CallLog) -> None:
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+        feat = client.feature("summarizer")
+        feat.track(event_type="$generation", session_id="s1", **self._SAMPLE)
+        event = mock_transport.events()[0]
+        self._assert_top_level_no_leak(event)
+
+    def test_feature_default_model_not_duplicated_in_metadata(
+        self, mock_transport: CallLog
+    ) -> None:
+        """feature(model=...) defaults go top-level only — never into metadata.
+        This locks the fix for the v0.5.0 bug where both paths were populated."""
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+        feat = client.feature("content_gen", model="gpt-4o")
+        feat.generation("s1")
+
+        event = next(e for e in mock_transport.events() if e["type"] == "$generation")
+        assert event["model"] == "gpt-4o"
+        assert "model" not in event.get("metadata", {})
+
+    def test_per_call_wire_field_overrides_feature_default(
+        self, mock_transport: CallLog
+    ) -> None:
+        """Per-call model beats the feature-scoped default. Common case:
+        feature = client.feature('chat', model='gpt-4o-mini') for cheap path,
+        but occasional feat.generation(session, model='gpt-4o') for complex."""
+        client = LitmusClient(api_key="ltm_pk_test_abc", sync_mode=True)
+        feat = client.feature("chat", model="gpt-4o-mini")
+        feat.generation("s1", model="gpt-4o")
+
+        event = next(e for e in mock_transport.events() if e["type"] == "$generation")
+        assert event["model"] == "gpt-4o"
 
 
 class TestAttach:
