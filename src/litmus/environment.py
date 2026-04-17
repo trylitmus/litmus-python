@@ -7,9 +7,13 @@ event with debugging and segmentation data.
 
 from __future__ import annotations
 
+import logging
 import os
 import platform
+import socket
 import sys
+
+log = logging.getLogger("litmus")
 
 
 def _detect_framework() -> str | None:
@@ -86,6 +90,22 @@ def _detect_ci() -> str | None:
     return None
 
 
+def _hostname() -> str | None:
+    """Best-effort raw hostname.
+
+    socket.gethostname() can fail in weird sandboxes (missing /etc/hostname,
+    restricted seccomp) or return an empty string. Swallow failures so we
+    never block $startup on metadata collection — hostname is nice to have,
+    never required.
+    """
+    try:
+        name = socket.gethostname()
+    except OSError:
+        log.debug("socket.gethostname() failed", exc_info=True)
+        return None
+    return name or None
+
+
 def collect_startup_metadata() -> dict:
     """Collect all environment metadata for the $startup event."""
     meta: dict = {
@@ -95,6 +115,14 @@ def collect_startup_metadata() -> dict:
         "os": f"{platform.system()} {platform.release()}",
         "arch": platform.machine(),
     }
+
+    # Raw hostname. For containerized deploys this is often the pod/container
+    # name (Railway, Fly, Kubernetes) which is exactly what you want for
+    # "which instance is sending this?" debugging. Kept separate from the
+    # derived cloud_provider field so ops can group by either.
+    host = _hostname()
+    if host:
+        meta["hostname"] = host
 
     # CPU count
     cpu_count = os.cpu_count()
