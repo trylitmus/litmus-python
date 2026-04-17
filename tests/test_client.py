@@ -333,8 +333,16 @@ class TestGenerationTopLevelFields:
         client.generation("s1", prompt_id="chat")
 
         event = next(e for e in mock_transport.events() if e["type"] == "$generation")
-        for key in ("model", "provider", "input_tokens", "output_tokens",
-                    "total_tokens", "duration_ms", "ttft_ms", "cost"):
+        for key in (
+            "model",
+            "provider",
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "duration_ms",
+            "ttft_ms",
+            "cost",
+        ):
             assert key not in event, f"{key} should be omitted when None"
 
     def test_feature_forwards_model_top_level(self, mock_transport: CallLog) -> None:
